@@ -306,8 +306,8 @@ with chart_cols[1]:
 # ===== 4. 최근 거래 내역 =====
 st.markdown("<h2 class='subheader'>Recent Trades</h2>", unsafe_allow_html=True)
 if not trades_df.empty:
-    # trade_id와 analysis_id 연결
-    merged_df = pd.merge(trades_df, ai_analysis_df, left_on='analysis_id', right_on='id', suffixes=('_trade', '_ai'), how='left')
+    # trade_id와 ai_analysis 연결
+    merged_df = pd.merge(trades_df, ai_analysis_df, left_on='id', right_on='trade_id', suffixes=('_trade', '_ai'), how='left')
     
     # 필요한 컬럼만 선택하고 순서 조정
     display_cols = merged_df[[
@@ -367,20 +367,13 @@ if not trades_df.empty:
             elif pl_value < 0:
                 pl_color = 'color: #dc3545;'
 
-        return [
-            f'{color}', # for Status column
-            f'{pl_color}', # for P/L (USDT) column
-            f'{pl_color}', # for P/L (%) column
-            '', '', '', '', '', '', '', '', '', '' # Default for other columns
-        ]
+        # 모든 컬럼에 대한 스타일 반환
+        return [color if col == 'Status' else pl_color if col in ['P/L (USDT)', 'P/L (%)'] else '' for col in display_cols.columns]
 
     # DataFrame을 HTML로 변환
     st.dataframe(
         display_cols.style
-        .apply(lambda row: highlight_status(row), 
-               axis=1, 
-               subset=['Status', 'P/L (USDT)', 'P/L (%)'] # Apply to specific columns
-        ), 
+        .apply(highlight_status, axis=1), 
         use_container_width=True
     )
 else:
@@ -391,14 +384,13 @@ st.markdown("<h2 class='subheader'>AI Analysis History</h2>", unsafe_allow_html=
 
 if not ai_analysis_df.empty:
     ai_display_cols = ai_analysis_df[[
-        'timestamp', 'direction', 'conviction', 'recommended_position_size', 
+        'timestamp', 'direction', 'recommended_position_size', 
         'recommended_leverage', 'stop_loss_percentage', 'take_profit_percentage', 'reasoning'
     ]].copy()
 
     ai_display_cols.rename(columns={
         'timestamp': 'Analysis Time',
         'direction': 'AI Direction',
-        'conviction': 'AI Conviction',
         'recommended_position_size': 'AI Pos Size %',
         'recommended_leverage': 'AI Leverage',
         'stop_loss_percentage': 'AI SL %',
@@ -407,7 +399,6 @@ if not ai_analysis_df.empty:
     }, inplace=True)
     
     ai_display_cols['AI Pos Size %'] = ai_display_cols['AI Pos Size %'].apply(lambda x: f"{x*100:.2f}%" if pd.notna(x) else 'N/A')
-    ai_display_cols['AI Conviction'] = ai_display_cols['AI Conviction'].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else 'N/A')
     ai_display_cols['AI SL %'] = ai_display_cols['AI SL %'].apply(lambda x: f"{x*100:.2f}%" if pd.notna(x) else 'N/A')
     ai_display_cols['AI TP %'] = ai_display_cols['AI TP %'].apply(lambda x: f"{x*100:.2f}%" if pd.notna(x) else 'N/A')
 

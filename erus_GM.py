@@ -79,6 +79,7 @@ def setup_database():
     CREATE TABLE IF NOT EXISTS trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp TEXT NOT NULL,           -- 거래 시작 시간
+        entry_timestamp TEXT NOT NULL,     -- 진입 시간 (추가된 컬럼)
         action TEXT NOT NULL,              -- long 또는 short
         entry_price REAL NOT NULL,         -- 진입 가격
         amount REAL NOT NULL,              -- 거래량 (BTC)
@@ -98,6 +99,12 @@ def setup_database():
         tp_order_id TEXT                   -- 테이크프로핏 주문 ID
     )
     ''')
+    
+    # 기존 trades 테이블에 entry_timestamp 컬럼이 없으면 추가
+    cursor.execute("PRAGMA table_info(trades)")
+    columns = [column[1] for column in cursor.fetchall()]
+    if 'entry_timestamp' not in columns:
+        cursor.execute('ALTER TABLE trades ADD COLUMN entry_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP')
     
     # AI 분석 결과 테이블
     cursor.execute('''
@@ -220,6 +227,7 @@ def save_trade(trade_data):
     cursor.execute('''
     INSERT INTO trades (
         timestamp,
+        entry_timestamp,
         action,
         entry_price,
         amount,
@@ -230,8 +238,9 @@ def save_trade(trade_data):
         tp_percentage,
         position_size_percentage,
         investment_amount
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
+        datetime.now().isoformat(),  # 거래 시작 시간
         datetime.now().isoformat(),  # 진입 시간
         trade_data.get('action', ''),  # 포지션 방향
         trade_data.get('entry_price', 0),  # 진입 가격
@@ -541,6 +550,8 @@ def fetch_multi_timeframe_data():
             
             # 타임스탬프를 날짜/시간 형식으로 변환
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            # JSON 직렬화를 위해 datetime 객체를 ISO 8601 문자열로 변환
+            df['timestamp'] = df['timestamp'].dt.strftime('%Y-%m-%dT%H:%M:%S')
             
             # 결과 딕셔너리에 저장
             multi_tf_data[tf_name] = df
@@ -1168,7 +1179,7 @@ def get_current_trade():
         cursor = conn.cursor()
         
         cursor.execute('''
-        SELECT id, action, entry_price, amount, leverage, sl_price, tp_price
+        SELECT id, action, entry_price, amount, leverage, sl_price, tp_price, entry_timestamp
         FROM trades
         WHERE status = 'OPEN'
         ORDER BY timestamp DESC
@@ -1186,7 +1197,8 @@ def get_current_trade():
                 'amount': result[3],
                 'leverage': result[4],
                 'sl_price': result[5],
-                'tp_price': result[6]
+                'tp_price': result[6],
+                'entry_timestamp': result[7]
             }
         return None
     except Exception as e:
@@ -1370,19 +1382,52 @@ while True:
                 time_since_entry = datetime.now() - entry_timestamp_dt
                 time_since_entry_hours = time_since_entry.total_seconds() / 3600
 
-                # 한 시간마다 AI에게 포지션 재평가 요청
-                if (datetime.now() - trading_state.last_ai_re_evaluation_time).total_seconds() >= 3600: # 3600초 = 1시간
-                    logger.info(f"포지션 유지 중 ({time_since_entry_hours:.1f} 시간 경과), AI에게 포지션 재평가를 요청합니다.")
-            
-                # 시장 데이터 수집 (AI 재평가를 위해 다시 수집) =====
+                # 재평가 조건:
+                # 1. 마지막 재평가로부터 1시간이 지났거나
+                # 2. 포지션 진입 후 1시간이 지났거나
+                # 3. 손익률이 ±5% 이상 변동했을 때
+                should_re_evaluate = False
+                
+                # 마지막 재평가로부터 1시간 경과
+                time_since_last_eval = (datetime.now() - trading_state.last_ai_re_evaluation_time).total_seconds() / 3600
+                if time_since_last_eval >= 1:
+                    should_re_evaluate = True
+                    logger.info(f"마지막 재평가로부터 {time_since_last_eval:.1f}시간 경과, 재평가를 요청합니다.")
+                
+                # 포지션 진입 후 1시간 경과 (최초 1회만)
+                elif time_since_entry_hours >= 1 and time_since_entry_hours < 1.04:  # 1시간~1시간 4분 사이에만
+                    should_re_evaluate = True
+                    logger.info(f"포지션 진입 후 {time_since_entry_hours:.1f}시간 경과, 최초 재평가를 요청합니다.")
+                
+                # 손익률 변동 확인
+                else:
+                    # 이전 손익률과 현재 손익률 비교
+                    previous_pnl = current_trade_in_db.get('last_pnl_percentage', 0)
+                    current_pnl = current_profit_loss_percentage
+                    pnl_change = abs(current_pnl - previous_pnl)
+                    
+                    if pnl_change >= 5.0:  # 5% 이상 변동
+                        should_re_evaluate = True
+                        logger.info(f"손익률 {pnl_change:.1f}% 변동 감지 (이전: {previous_pnl:.1f}% → 현재: {current_pnl:.1f}%), 재평가를 요청합니다.")
+                
+                if not should_re_evaluate:
+                    wait_time = 300  # 5분 대기
+                    
+                    logger.info(f"재평가 조건 미충족 - 다음 재평가까지 {wait_time/60:.0f}분 대기")
+                    time.sleep(wait_time)  # 계산된 시간만큼 대기
+                    continue
+
+                logger.info(f"포지션 재평가 시작 (진입 후 {time_since_entry_hours:.1f}시간 경과)")
+                
+                # 시장 데이터 수집 (AI 재평가를 위해 다시 수집)
                 multi_tf_data = fetch_multi_timeframe_data()
                 order_book = fetch_order_book()
                 large_trades = fetch_large_trades()
                 recent_news = fetch_bitcoin_news()
-                historical_trading_data = get_historical_trading_data(limit=10) # 최근 10개 거래
+                historical_trading_data = get_historical_trading_data(limit=10)
                 performance_metrics = get_performance_metrics()
-            
-                # 6. AI 분석을 위한 데이터 준비 =====
+                
+                # AI 분석을 위한 데이터 준비
                 market_analysis = {
                     "timestamp": datetime.now().isoformat(),
                     "current_price": current_price,
@@ -1395,12 +1440,13 @@ while True:
                 }
                 for tf_name, df in multi_tf_data.items():
                     market_analysis["timeframes"][tf_name] = df.to_dict(orient="records")
-                    
+                
                 # AI 포지션 재평가 시스템 프롬프트
                 re_evaluation_system_prompt = """
 You are a highly analytical crypto trading expert with an OPEN BTC/USDT futures position.
 Your primary task is to critically re-evaluate the market and advise whether to **MAINTAIN** this position or **CLOSE** it immediately.
 Prioritize capital preservation and securing profits.
+주어진 데이터를 천천히, 철저히 분석하여 신중한 판단을 내리세요. 
 
 **Current Position Details:**
 - Direction: {current_side_upper}
@@ -1414,7 +1460,7 @@ Prioritize capital preservation and securing profits.
 - Time since entry: {time_since_entry_hours:.1f} hours
 
 **Market Data:**
-{market_analysis_json_string} # This is the full market_analysis_json_string from the main loop.
+{market_analysis_json_string}
 
 **Your Decision Process:**
 1.  **Assess Position Performance:** Evaluate current P/L against SL/TP and time in trade.
@@ -1424,13 +1470,13 @@ Prioritize capital preservation and securing profits.
     * **MAINTAIN:** If market outlook remains favorable and risk is controlled.
     * **CLOSE:** If conditions have deteriorated, risk has increased unacceptably, or a clear exit signal is present.
 
-**Output Format (STRICT JSON - NO MARKDOWN BLOCK):**
+**IMPORTANT: Your response must be a valid JSON object with the following structure:**
+{{
+    "action": "MAINTAIN" or "CLOSE",
+    "reasoning": "Your concise explanation for maintaining or closing the position"
+}}
 
-```json
-{
-  "action": "MAINTAIN" or "CLOSE",
-  "reasoning": "Concise explanation for maintaining or closing the position based on market changes and risk assessment."
-}
+DO NOT include any markdown formatting, code blocks, or additional text. Return ONLY the JSON object.
 """
             
                 # AI 재평가 프롬프트에 동적 정보 주입
@@ -1469,7 +1515,27 @@ Prioritize capital preservation and securing profits.
                             re_evaluation_content = re_evaluation_content.rsplit("```", 1)[0]
                         re_evaluation_content = re_evaluation_content.strip()
 
-                    re_evaluation_decision = json.loads(re_evaluation_content)
+                    # JSON 파싱 시도
+                    try:
+                        re_evaluation_decision = json.loads(re_evaluation_content)
+                    except json.JSONDecodeError as e:
+                        # JSON 파싱 실패 시 응답 내용을 정리하고 다시 시도
+                        logger.warning(f"Initial JSON parsing failed: {e}")
+                        # 불필요한 공백과 줄바꿈 제거
+                        re_evaluation_content = ' '.join(re_evaluation_content.split())
+                        # JSON 파싱 재시도
+                        re_evaluation_decision = json.loads(re_evaluation_content)
+
+                    # 필수 키 확인
+                    required_keys = ['action', 'reasoning']
+                    missing_keys = [key for key in required_keys if key not in re_evaluation_decision]
+                    
+                    if missing_keys:
+                        raise ValueError(f"Missing required keys in re-evaluation decision: {missing_keys}")
+
+                    # action 값 검증
+                    if re_evaluation_decision['action'] not in ['MAINTAIN', 'CLOSE']:
+                        raise ValueError(f"Invalid action value: {re_evaluation_decision['action']}. Must be 'MAINTAIN' or 'CLOSE'")
 
                     logger.info(f"AI 재평가 결정: {re_evaluation_decision['action']}, 근거: {re_evaluation_decision['reasoning']}")
 
@@ -1485,7 +1551,6 @@ Prioritize capital preservation and securing profits.
                             reason="CLOSED_BY_AI_RE_EVALUATION"
                         )
                         # 포지션이 닫혔으므로 다음 루프에서 새로운 포지션 진입을 고려하도록 함
-                        # current_trade_in_db를 None으로 설정하여 다음 루프에서 else 블록으로 진입하게 유도
                         current_trade_in_db = None 
                         current_side = None # 바이낸스 포지션도 닫혔다고 가정
                         time.sleep(10) # 청산 후 잠시 대기
@@ -1498,8 +1563,12 @@ Prioritize capital preservation and securing profits.
 
                 except json.JSONDecodeError as e:
                     logger.error(f"AI 재평가 응답 JSON 파싱 오류: {e}")
-                    logger.error(f"AI 재평가 Raw 응답: {re_evaluation_response.choices[0].message.content}")
+                    logger.error(f"AI 재평가 Raw 응답: {re_evaluation_content}")
                     # 오류 발생 시 재평가 시간 업데이트하지 않음 (다음 루프에서 다시 시도)
+                except ValueError as e:
+                    logger.error(f"AI 재평가 데이터 검증 오류: {e}")
+                    logger.error(f"AI 재평가 Raw 응답: {re_evaluation_content}")
+                    # 오류 발생 시 재평가 시간 업데이트하지 않음
                 except Exception as e:
                     logger.error(f"AI 재평가 요청 또는 처리 중 기타 오류: {e}", exc_info=True)
                     # 오류 발생 시 재평가 시간 업데이트하지 않음
@@ -1570,6 +1639,7 @@ Prioritize capital preservation and securing profits.
 You are an elite crypto trading expert specializing in data-driven decisions and risk management for BTC/USDT futures.
 Your core mission is to achieve a minimum 1% daily return while strictly preserving capital.
 Every decision must prioritize minimizing losses and maximizing the win rate (target 2.5:1 Reward/Risk).
+주어진 가정과 데이터를 천천히 그리고 철저히 분석하고 판단하여 거래 결정을 내리세요. 
 
 **Decision Process:**
 
@@ -1579,7 +1649,7 @@ Every decision must prioritize minimizing losses and maximizing the win rate (ta
     * Compare LONG vs SHORT performance and leverage outcomes.
 
 2.  **Evaluate Current Market Conditions:**
-    * **Trend Analysis (Multi-timeframe: 4h, 1h, 15m, 1m):** Identify overall bias (4h, 1h for direction; 15m, 1m for entry timing).
+    * **Trend Analysis (Multi-timeframe: 4h, 1h, 15m, 5m):** Identify overall bias (4h, 1h, 15m for direction; 5m for entry timing).
     * **Volume & Liquidity:** Observe volume trends, large trades (>50 BTC), order book imbalances, and liquidity gaps.
     * **Volatility:** Assess volatility across timeframes.
     * **Key Levels:** Pinpoint crucial support/resistance levels with volume confirmation.
@@ -1610,17 +1680,17 @@ Every decision must prioritize minimizing losses and maximizing the win rate (ta
     * **Target Ratio:** Aim for a 2.5:1 Reward/Risk ratio where possible.
     * **Learning:** Adapt based on historical SL/TP performance.
 
-**Output Format (STRICT JSON - NO MARKDOWN BLOCK):**
+**IMPORTANT: Your response must be a valid JSON object with the following structure:**
+{{
+    "direction": "LONG" or "SHORT" or "NO_POSITION",
+    "recommended_position_size": decimal between 0.1-1.0,
+    "recommended_leverage": integer between 1-20,
+    "stop_loss_percentage": decimal (e.g., 0.005 for 0.5%),
+    "take_profit_percentage": decimal (e.g., 0.0125 for 1.25%),
+    "reasoning": "Your concise explanation"
+}}
 
-```json
-{
-  "direction": "LONG" or "SHORT" or "NO_POSITION",
-  "recommended_position_size": [decimal between 0.1-1.0 representing fraction of available capital],
-  "recommended_leverage": [integer between 1-20],
-  "stop_loss_percentage": [decimal, e.g., 0.005 for 0.5%],
-  "take_profit_percentage": [decimal, e.g., 0.0125 for 1.25%],
-  "reasoning": "Concise explanation of your decision based on trend, volume, news, and risk management."
-}
+DO NOT include any markdown formatting, code blocks, or additional text. Return ONLY the JSON object.
 """
             # AI 분석을 위한 시스템 프롬프트 설정
                  
@@ -1651,8 +1721,24 @@ Every decision must prioritize minimizing losses and maximizing the win rate (ta
                         response_content = response_content.rsplit("```", 1)[0]
                     response_content = response_content.strip()
                 
-                # JSON 파싱
-                trading_decision = json.loads(response_content)
+                # JSON 파싱 시도
+                try:
+                    trading_decision = json.loads(response_content)
+                except json.JSONDecodeError as e:
+                    # JSON 파싱 실패 시 응답 내용을 정리하고 다시 시도
+                    print(f"Initial JSON parsing failed: {e}")
+                    # 불필요한 공백과 줄바꿈 제거
+                    response_content = ' '.join(response_content.split())
+                    # JSON 파싱 재시도
+                    trading_decision = json.loads(response_content)
+                
+                # 필수 키 확인
+                required_keys = ['direction', 'recommended_position_size', 'recommended_leverage', 
+                               'stop_loss_percentage', 'take_profit_percentage', 'reasoning']
+                missing_keys = [key for key in required_keys if key not in trading_decision]
+                
+                if missing_keys:
+                    raise ValueError(f"Missing required keys in trading decision: {missing_keys}")
                 
                 # 결정 내용 출력
                 print(f"AI 거래 결정:")
@@ -1683,7 +1769,7 @@ Every decision must prioritize minimizing losses and maximizing the win rate (ta
                 if action == "no_position":
                     print("현재 시장 상황에서는 포지션을 열지 않는 것이 좋습니다.")
                     print(f"이유: {trading_decision['reasoning']}")
-                    time.sleep(60)  # 포지션 없을 때 1분 대기
+                    time.sleep(900)  # 포지션 없을 때 15분 대기
                     continue
                     
                 # ===== 9. 투자 금액 계산 =====
@@ -1722,7 +1808,20 @@ Every decision must prioritize minimizing losses and maximizing the win rate (ta
                 if action == "long":  # 롱 포지션
                     # 시장가 매수 주문
                     order = exchange.create_market_buy_order(symbol, amount)
-                    entry_price = current_price
+                    
+                    # 실제 체결 내역 조회
+                    time.sleep(2)  # 주문 체결 대기
+                    recent_trades = exchange.fetch_my_trades(symbol, limit=10, params={'orderId': order['id']})
+                    
+                    if recent_trades:
+                        # 체결 내역에서 평균 체결가격 계산
+                        total_executed_amount = sum(t['amount'] for t in recent_trades)
+                        total_cost_or_revenue = sum(t['price'] * t['amount'] for t in recent_trades)
+                        entry_price = total_cost_or_revenue / total_executed_amount if total_executed_amount > 0 else current_price
+                        logger.info(f"실제 체결가격: {entry_price:,.2f} (주문 ID: {order['id']})")
+                    else:
+                        entry_price = current_price
+                        logger.warning(f"체결 내역을 찾을 수 없어 현재가격({current_price:,.2f})을 진입가격으로 사용합니다.")
                     
                     # 스탑로스/테이크프로핏 가격 계산
                     sl_price = round(entry_price * (1 - sl_percentage), 2)   # AI 추천 비율만큼 하락
@@ -1755,6 +1854,9 @@ Every decision must prioritize minimizing losses and maximizing the win rate (ta
                     conn.commit()
                     conn.close()
                     
+                    # 포지션 진입 시점에 재평가 시간 초기화
+                    trading_state.last_ai_re_evaluation_time = datetime.now()
+                    
                     print(f"\n=== LONG Position Opened ===")
                     print(f"Entry: ${entry_price:,.2f}")
                     print(f"Stop Loss: ${sl_price:,.2f} (-{sl_percentage*100:.2f}%)")
@@ -1766,7 +1868,20 @@ Every decision must prioritize minimizing losses and maximizing the win rate (ta
                 elif action == "short":  # 숏 포지션
                     # 시장가 매도 주문
                     order = exchange.create_market_sell_order(symbol, amount)
-                    entry_price = current_price
+                    
+                    # 실제 체결 내역 조회
+                    time.sleep(2)  # 주문 체결 대기
+                    recent_trades = exchange.fetch_my_trades(symbol, limit=10, params={'orderId': order['id']})
+                    
+                    if recent_trades:
+                        # 체결 내역에서 평균 체결가격 계산
+                        total_executed_amount = sum(t['amount'] for t in recent_trades)
+                        total_cost_or_revenue = sum(t['price'] * t['amount'] for t in recent_trades)
+                        entry_price = total_cost_or_revenue / total_executed_amount if total_executed_amount > 0 else current_price
+                        logger.info(f"실제 체결가격: {entry_price:,.2f} (주문 ID: {order['id']})")
+                    else:
+                        entry_price = current_price
+                        logger.warning(f"체결 내역을 찾을 수 없어 현재가격({current_price:,.2f})을 진입가격으로 사용합니다.")
                     
                     # 스탑로스/테이크프로핏 가격 계산
                     sl_price = round(entry_price * (1 + sl_percentage), 2)   # AI 추천 비율만큼 상승
@@ -1798,6 +1913,9 @@ Every decision must prioritize minimizing losses and maximizing the win rate (ta
                     cursor.execute(update_analysis_sql, (trade_id, analysis_id))
                     conn.commit()
                     conn.close()
+                    
+                    # 포지션 진입 시점에 재평가 시간 초기화
+                    trading_state.last_ai_re_evaluation_time = datetime.now()
                     
                     print(f"\n=== SHORT Position Opened ===")
                     print(f"Entry: ${entry_price:,.2f}")
