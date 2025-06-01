@@ -1781,10 +1781,19 @@ DO NOT include any markdown formatting, code blocks, or additional text. Return 
                 position_size_percentage = trading_decision['recommended_position_size']
                 investment_amount = available_capital * position_size_percentage
                 
-                # 최소 주문 금액 확인 (최소 100 USDT)
-                if investment_amount < 100:
-                    investment_amount = 100
-                    print(f"최소 주문 금액(100 USDT)으로 조정됨")
+                # 바이낸스에서 최소 주문 금액 확인
+                try:
+                    market_info = exchange.fetch_market(symbol)
+                    min_order_amount = float(market_info['limits']['amount']['min']) * current_price
+                    if investment_amount < min_order_amount:
+                        investment_amount = min_order_amount
+                        print(f"최소 주문 금액({min_order_amount:.2f} USDT)으로 조정됨")
+                except Exception as e:
+                    print(f"최소 주문 금액 확인 중 오류 발생: {e}")
+                    # 오류 발생 시 기본값 100 USDT 사용
+                    if investment_amount < 100:
+                        investment_amount = 100
+                        print(f"최소 주문 금액(100 USDT)으로 조정됨")
                 
                 print(f"투자 금액: {investment_amount:.2f} USDT")
                 

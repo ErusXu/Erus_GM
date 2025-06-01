@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import ccxt  # 암호화폐 거래소 API 라이브러리
 import numpy as np
 import os
+import time
 
 # 페이지 설정
 st.set_page_config(
@@ -88,6 +89,27 @@ def load_data():
         
     if not ai_analysis_df.empty:
         ai_analysis_df['timestamp'] = pd.to_datetime(ai_analysis_df['timestamp'])
+    
+    # 현재 잔액 확인
+    try:
+        exchange = ccxt.binance({
+            'apiKey': os.getenv('BINANCE_API_KEY'),
+            'secret': os.getenv('BINANCE_SECRET_KEY'),
+            'enableRateLimit': True,
+            'options': {'defaultType': 'future'}
+        })
+        balance = exchange.fetch_balance()
+        available_capital = balance['USDT']['free']  # 가용 USDT 잔액
+        
+        if available_capital <= 0:
+            st.warning("가용 USDT 잔액이 없습니다.")
+            return trades_df, ai_analysis_df
+            
+        st.info(f"현재 가용 USDT 잔액: {available_capital:,.2f} USDT")
+        
+    except Exception as e:
+        st.warning(f"잔액 확인 중 오류 발생: {e}")
+        return trades_df, ai_analysis_df
         
     return trades_df, ai_analysis_df
 
